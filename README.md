@@ -442,3 +442,28 @@ Contributions are welcome! Please:
 ## License
 
 MIT License -- see [LICENSE](LICENSE) for details.
+
+## Cuan private hosted mode
+
+`Dockerfile.cuan` builds `go/cmd/cuan-hosted` as a separate Search Console MCP
+service. It does not use the upstream service-account credential resolver.
+Cuan owns OAuth refresh tokens and exact property grants; this service receives
+only a short-lived access token per operation. The hosted MCP surface contains
+three tools: `search_analytics` (at most 31 days and 100 rows),
+`preview_submit_sitemap`, and `submit_sitemap` (one same-site XML sitemap on an
+owned disposable test property). A sitemap write needs explicit confirmation,
+a signed five-minute preview, a one-time Cuan claim, provider readback, and a
+Cuan finalization ACK. Unknown provider outcomes remain reserved in Cuan.
+
+Configuration: `CUAN_SEARCH_CONSOLE_RUNTIME_URL` (HTTPS),
+`SEARCH_CONSOLE_PRIVATE_SERVICE_ID`, `SEARCH_CONSOLE_PRIVATE_SERVICE_SECRET`,
+`SEARCH_CONSOLE_INGRESS_SECRET`, `SEARCH_CONSOLE_PREVIEW_SIGNING_SECRET` (each
+secret at least 32 characters), and `SEARCH_CONSOLE_MCP_ALLOWED_HOST` (one exact
+Host header, with port when present). The service listens on `PORT` (default
+8080). Every `/mcp` POST requires `x-cuan-search-console-ingress-secret` and
+`x-cuan-mcp-connection-key`. The service is intended for private ingress;
+Cuan's Search Console runtime must be separately deployed and enabled. Hosted
+mode is default-off until that happens. No other upstream tools are exposed.
+
+Focused validation: `cd go && go test ./cmd/cuan-hosted`. The container build
+runs this test before producing a nonroot distroless runtime image.
