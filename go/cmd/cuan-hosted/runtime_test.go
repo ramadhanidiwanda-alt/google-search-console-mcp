@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -17,6 +19,40 @@ import (
 const testKey = "ci_mcp_ck_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 const testSite = "https://example.com/"
 const testMap = "https://example.com/sitemap.xml"
+
+func TestUnifiedPermitBindsExactBytesAndWritesOnce(t *testing.T) {
+	resourceHash := sha256.Sum256([]byte(testSite))
+	resourceID := hex.EncodeToString(resourceHash[:])
+	redemptions := 0
+	finalizations := 0
+	redeemer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-cuan-mcp-connection-key") != "" || r.Header.Get("x-cuan-search-console-service-secret") != strings.Repeat("s", 32) {
+			t.Fatal("redeem leaked caller key or lost service proof")
+		}
+		if strings.HasSuffix(r.URL.Path, "/mcp-finalize-execution") {
+			finalizations++
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		redemptions++
+		_, _ = w.Write([]byte(`{"ok":true,"provider":"search_console","resourceId":"` + resourceID + `","providerTarget":"` + testSite + `","accessToken":"ephemeral","previewId":"preview-123","approvalDigest":"` + strings.Repeat("a", 64) + `"}`))
+	}))
+	defer redeemer.Close()
+	g := &fakeGoogle{}
+	s := &unifiedService{Endpoint: redeemer.URL + "/functions/v1/mcp-redeem-google-permit", ServiceID: "service", ServiceSecret: strings.Repeat("s", 32), Client: redeemer.Client(), Google: g}
+	canonical := `{"accountId":"` + resourceID + `","sitemapUrl":"` + testMap + `","confirmed":true,"previewId":"preview-123","approvalDigest":"` + strings.Repeat("a", 64) + `"}`
+	d := sha256.Sum256([]byte(canonical))
+	in := unifiedInput{GoogleInvocation: googleInvocation{Version: 1, PublicTool: "google_search_console_submit_sitemap", Provider: "search_console", ResourceID: resourceID, CanonicalArgumentsJSON: canonical, Digest: hex.EncodeToString(d[:]), ExecutionID: "execution_123", Permit: strings.Repeat("p", 43)}}
+	changed := in
+	changed.GoogleInvocation.CanonicalArgumentsJSON += " "
+	if _, err := s.invoke(context.Background(), in.GoogleInvocation.PublicTool, changed); err == nil || redemptions != 0 || g.writes != 0 {
+		t.Fatal("changed argument bytes reached redeem")
+	}
+	result, err := s.invoke(context.Background(), in.GoogleInvocation.PublicTool, in)
+	if err != nil || result.(map[string]any)["status"] != "CONFIRMED" || redemptions != 1 || finalizations != 1 || g.writes != 1 {
+		t.Fatalf("write not single-dispatched: %#v %v", result, err)
+	}
+}
 
 type fakeAuthority struct {
 	actions []string
