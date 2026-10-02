@@ -31,6 +31,20 @@ func result(value any) (*mcp.CallToolResult, any, error) {
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: string(b)}}}, nil, nil
 }
 func addTools(srv *mcp.Server, s *service) {
+	for _, name := range []string{"google_search_console_list_sites", "google_search_console_search_analytics", "google_search_console_preview_submit_sitemap", "google_search_console_submit_sitemap"} {
+		toolName := name
+		mcp.AddTool(srv, &mcp.Tool{Name: toolName, Description: "Cuan-admitted Search Console operation."},
+			func(ctx context.Context, _ *mcp.CallToolRequest, in unifiedInput) (*mcp.CallToolResult, any, error) {
+				if keyFrom(ctx) != "" || s.Unified == nil {
+					return nil, nil, errDenied
+				}
+				v, err := s.Unified.invoke(ctx, toolName, in)
+				if err != nil {
+					return nil, nil, err
+				}
+				return result(v)
+			})
+	}
 	mcp.AddTool(srv, &mcp.Tool{Name: "search_analytics", Description: "Read at most 100 rows over at most 31 days from one exact Cuan-granted Search Console property."},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in analyticsInput) (*mcp.CallToolResult, any, error) {
 			v, e := s.analytics(ctx, keyFrom(ctx), in)
@@ -63,9 +77,9 @@ func buildHandler(srv *mcp.Server, allowedHost, ingressSecret string) http.Handl
 		w.Header().Set("Cache-Control", "no-store")
 		if r.URL.Path != "/mcp" || r.Method != http.MethodPost || r.Host != allowedHost ||
 			len(r.Header.Values("x-cuan-search-console-ingress-secret")) != 1 ||
-			len(r.Header.Values("x-cuan-mcp-connection-key")) != 1 ||
+			len(r.Header.Values("x-cuan-mcp-connection-key")) > 1 ||
 			subtle.ConstantTimeCompare([]byte(r.Header.Get("x-cuan-search-console-ingress-secret")), []byte(ingressSecret)) != 1 ||
-			!connectionKey.MatchString(r.Header.Get("x-cuan-mcp-connection-key")) ||
+			(r.Header.Get("x-cuan-mcp-connection-key") != "" && !connectionKey.MatchString(r.Header.Get("x-cuan-mcp-connection-key"))) ||
 			r.ContentLength < 1 || r.ContentLength > 65536 {
 			http.Error(w, "denied", http.StatusForbidden)
 			return
@@ -108,6 +122,16 @@ func main() {
 	cuanClient := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	googleHTTP := &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	s := &service{Authority: &cuanAuthority{Endpoint: endpoint, ServiceID: serviceID, ServiceSecret: serviceSecret, Client: cuanClient}, Google: &googleClient{Client: googleHTTP, Base: apiBase}, SigningSecret: []byte(signingSecret)}
+	redeemURL := os.Getenv("CUAN_SEARCH_CONSOLE_REDEEM_URL")
+	if redeemURL == "" {
+		redeemURL = endpoint[:strings.LastIndex(endpoint, "/")] + "/mcp-redeem-google-permit"
+	}
+	if redeemURL != "" {
+		if !strings.HasPrefix(redeemURL, "https://") {
+			panic("CUAN_SEARCH_CONSOLE_REDEEM_URL requires HTTPS")
+		}
+		s.Unified = &unifiedService{Endpoint: redeemURL, ServiceID: serviceID, ServiceSecret: serviceSecret, Client: cuanClient, Google: s.Google}
+	}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "cuan-search-console-mcp", Version: "0.1.0"}, nil)
 	addTools(srv, s)
 	handler := buildHandler(srv, allowedHost, ingressSecret)

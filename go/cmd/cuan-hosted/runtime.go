@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -222,6 +223,230 @@ type service struct {
 	Google        googleAPI
 	SigningSecret []byte
 	Now           func() time.Time
+	Unified       *unifiedService
+}
+
+type googleInvocation struct {
+	Version                int    `json:"version"`
+	PublicTool             string `json:"publicTool"`
+	Provider               string `json:"provider"`
+	ResourceID             string `json:"resourceId"`
+	CanonicalArgumentsJSON string `json:"canonicalArgumentsJson"`
+	Digest                 string `json:"digest"`
+	ExecutionID            string `json:"executionId"`
+	Permit                 string `json:"permit"`
+}
+type unifiedInput struct {
+	GoogleInvocation googleInvocation `json:"googleInvocation"`
+}
+type grantResource struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	ConnectionID string `json:"connectionId,omitempty"`
+}
+type redeemResult struct {
+	OK             bool            `json:"ok"`
+	Provider       string          `json:"provider"`
+	ResourceID     string          `json:"resourceId"`
+	ProviderTarget *string         `json:"providerTarget"`
+	AccessToken    *string         `json:"accessToken"`
+	Resources      []grantResource `json:"resources"`
+	PreviewID      string          `json:"previewId"`
+	ApprovalDigest string          `json:"approvalDigest"`
+}
+type unifiedService struct {
+	Endpoint, ServiceID, ServiceSecret string
+	Client                             *http.Client
+	Google                             googleAPI
+}
+type invocationState struct{ validated, redeemed, mutationDispatched bool }
+
+func (s *unifiedService) finalize(ctx context.Context, v googleInvocation, outcome string) error {
+	endpoint := s.Endpoint[:strings.LastIndex(s.Endpoint, "/")] + "/mcp-finalize-execution"
+	body, _ := json.Marshal(map[string]string{"executionId": v.ExecutionID, "permit": v.Permit, "outcome": outcome})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return errors.New("CUAN_FINALIZATION_UNKNOWN")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-cuan-search-console-service-id", s.ServiceID)
+	req.Header.Set("x-cuan-search-console-service-secret", s.ServiceSecret)
+	resp, err := s.Client.Do(req)
+	if err != nil {
+		return errors.New("CUAN_FINALIZATION_UNKNOWN")
+	}
+	defer resp.Body.Close()
+	var ack struct {
+		OK bool `json:"ok"`
+	}
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(resp.Body, 8192)).Decode(&ack) != nil || !ack.OK {
+		return errors.New("CUAN_FINALIZATION_UNKNOWN")
+	}
+	return nil
+}
+
+func (s *unifiedService) invoke(ctx context.Context, tool string, in unifiedInput) (any, error) {
+	state := &invocationState{}
+	value, err := s.execute(ctx, tool, in, state)
+	if state.validated {
+		outcome := "succeeded"
+		if err != nil {
+			outcome = "failed_before_dispatch"
+			if state.mutationDispatched {
+				outcome = "failed_after_dispatch"
+			}
+		}
+		if finalizeErr := s.finalize(ctx, in.GoogleInvocation, outcome); finalizeErr != nil {
+			return nil, finalizeErr
+		}
+	}
+	return value, err
+}
+
+func (s *unifiedService) execute(ctx context.Context, tool string, in unifiedInput, state *invocationState) (any, error) {
+	v := in.GoogleInvocation
+	if v.Version != 1 || v.PublicTool != tool || v.Provider != "search_console" ||
+		!hexDigest.MatchString(v.Digest) || !regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`).MatchString(v.ExecutionID) ||
+		!regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`).MatchString(v.Permit) || len(v.CanonicalArgumentsJSON) > 65536 {
+		return nil, errDenied
+	}
+	sum := sha256.Sum256([]byte(v.CanonicalArgumentsJSON))
+	if hex.EncodeToString(sum[:]) != v.Digest {
+		return nil, errDenied
+	}
+	var args map[string]any
+	if json.Unmarshal([]byte(v.CanonicalArgumentsJSON), &args) != nil || args == nil {
+		return nil, errInvalid
+	}
+	if tool == "google_search_console_list_sites" {
+		if v.ResourceID != "" {
+			return nil, errDenied
+		}
+	} else if args["accountId"] != v.ResourceID || !hexDigest.MatchString(v.ResourceID) {
+		return nil, errDenied
+	}
+	state.validated = true
+	body, _ := json.Marshal(map[string]any{"googleInvocation": v})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.Endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, errDenied
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-cuan-search-console-service-id", s.ServiceID)
+	req.Header.Set("x-cuan-search-console-service-secret", s.ServiceSecret)
+	resp, err := s.Client.Do(req)
+	if err != nil {
+		return nil, errDenied
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, errDenied
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16385))
+	if err != nil || len(raw) > 16384 {
+		return nil, errDenied
+	}
+	var redeemed redeemResult
+	if json.Unmarshal(raw, &redeemed) != nil || !redeemed.OK || redeemed.Provider != "search_console" || redeemed.ResourceID != v.ResourceID {
+		return nil, errDenied
+	}
+	state.redeemed = true
+	if tool == "google_search_console_list_sites" {
+		return map[string]any{"sites": redeemed.Resources}, nil
+	}
+	if redeemed.AccessToken == nil || *redeemed.AccessToken == "" || len(*redeemed.AccessToken) > 8192 || redeemed.ProviderTarget == nil {
+		return nil, errDenied
+	}
+	site := *redeemed.ProviderTarget
+	if _, _, _, err := siteIdentity(site); err != nil {
+		return nil, errDenied
+	}
+	siteHash := sha256.Sum256([]byte(site))
+	if hex.EncodeToString(siteHash[:]) != v.ResourceID {
+		return nil, errDenied
+	}
+	token := *redeemed.AccessToken
+	if tool == "google_search_console_search_analytics" {
+		since, ok1 := args["since"].(string)
+		until, ok2 := args["until"].(string)
+		if !ok1 || !ok2 {
+			return nil, errInvalid
+		}
+		start, e1 := parseDate(since)
+		end, e2 := parseDate(until)
+		if e1 != nil || e2 != nil || end.Before(start) || end.Sub(start) > 30*24*time.Hour {
+			return nil, errInvalid
+		}
+		limit := 100
+		if v, ok := args["limit"]; ok {
+			f, ok := v.(float64)
+			if !ok || f < 1 || f > 1000 || f != float64(int(f)) {
+				return nil, errInvalid
+			}
+			limit = int(f)
+		}
+		prefix := digest([]any{site, since, until, limit})[:16]
+		offset := 0
+		if cursor, ok := args["cursor"]; ok {
+			c, ok := cursor.(string)
+			if !ok || !strings.HasPrefix(c, prefix+":") {
+				return nil, errInvalid
+			}
+			parsed, e := strconv.Atoi(strings.TrimPrefix(c, prefix+":"))
+			if e != nil || parsed < 0 || parsed > 9999999 {
+				return nil, errInvalid
+			}
+			offset = parsed
+		}
+		data, err := s.Google.Do(ctx, token, http.MethodPost, "/sites/"+url.PathEscape(site)+"/searchAnalytics/query",
+			map[string]any{"startDate": since, "endDate": until, "dimensions": []string{"query"}, "rowLimit": limit, "startRow": offset})
+		if err != nil {
+			return nil, err
+		}
+		rows, ok := data["rows"].([]any)
+		if !ok && data["rows"] != nil {
+			return nil, errProvider
+		}
+		if len(rows) > limit {
+			return nil, errProvider
+		}
+		return map[string]any{"siteUrl": site, "rows": rows, "nextCursor": func() any {
+			if len(rows) == limit {
+				return fmt.Sprintf("%s:%d", prefix, offset+limit)
+			}
+			return nil
+		}()}, nil
+	}
+	sitemap, ok := args["sitemapUrl"].(string)
+	if !ok || sitemapTarget(site, sitemap) != nil {
+		return nil, errInvalid
+	}
+	if err := (&service{Google: s.Google}).verifiedSite(ctx, token, site, true); err != nil {
+		return nil, errDenied
+	}
+	if tool == "google_search_console_preview_submit_sitemap" {
+		if redeemed.PreviewID == "" || !hexDigest.MatchString(redeemed.ApprovalDigest) {
+			return nil, errDenied
+		}
+		return map[string]any{"siteUrl": site, "sitemapUrl": sitemap, "requiresConfirmation": true,
+			"previewId": redeemed.PreviewID, "approvalDigest": redeemed.ApprovalDigest}, nil
+	}
+	if tool != "google_search_console_submit_sitemap" {
+		return nil, errInvalid
+	}
+	if args["confirmed"] != true {
+		return nil, errDenied
+	}
+	if args["previewId"] != redeemed.PreviewID || args["approvalDigest"] != redeemed.ApprovalDigest ||
+		redeemed.PreviewID == "" || !hexDigest.MatchString(redeemed.ApprovalDigest) {
+		return nil, errDenied
+	}
+	state.mutationDispatched = true
+	_, err = s.Google.Do(ctx, token, http.MethodPut, "/sites/"+url.PathEscape(site)+"/sitemaps/"+url.PathEscape(sitemap), nil)
+	if err != nil {
+		return nil, errors.New("UNKNOWN_OUTCOME: inspect Search Console sitemap before retrying")
+	}
+	return map[string]any{"siteUrl": site, "sitemapUrl": sitemap, "executionId": v.ExecutionID, "status": "CONFIRMED"}, nil
 }
 
 func (s *service) now() time.Time {
@@ -235,7 +460,7 @@ func (s *service) call(ctx context.Context, key, action string, r authorityReque
 	if err != nil {
 		return credential{}, errDenied
 	}
-	if c.SiteURL != r.SiteURL || c.RequestDigest != r.RequestDigest || c.ExecutionID != r.ExecutionID || !c.SiteVerified || c.AccessToken == "" || len(c.AccessToken) > 4096 || c.ExpiresAt <= s.now().Add(time.Second).UnixMilli() || !(c.Scope == readScope || c.Scope == writeScope) || write && (c.Scope != writeScope || !c.SiteOwner || !c.DisposableTestSite || !c.WriteClaimed) || r.Operation == "sitemap_preview" && (!c.SiteOwner || !c.DisposableTestSite) {
+	if c.SiteURL != r.SiteURL || c.RequestDigest != r.RequestDigest || c.ExecutionID != r.ExecutionID || !c.SiteVerified || c.AccessToken == "" || len(c.AccessToken) > 4096 || c.ExpiresAt <= s.now().Add(time.Second).UnixMilli() || !(c.Scope == readScope || c.Scope == writeScope) || write && (c.Scope != writeScope || !c.SiteOwner || !c.WriteClaimed) || r.Operation == "sitemap_preview" && !c.SiteOwner {
 		return credential{}, errDenied
 	}
 	return c, nil
